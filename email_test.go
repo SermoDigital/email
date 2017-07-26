@@ -1,7 +1,12 @@
 package email
 
 import (
+	"encoding"
+	"encoding/base64"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"bytes"
 	"crypto/rand"
@@ -11,51 +16,78 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
-	"net/smtp"
 	"net/textproto"
 )
 
-func TestEmailTextHtmlAttachment(t *testing.T) {
-	e := NewEmail()
-	e.From = "Jordan Wright <test@example.com>"
-	e.To = []string{"test@example.com"}
-	e.Bcc = []string{"test_bcc@example.com"}
-	e.Cc = []string{"test_cc@example.com"}
-	e.Subject = "Awesome Subject"
-	e.Text = []byte("Text Body is, of course, supported!\n")
-	e.HTML = []byte("<h1>Fancy Html is supported, too!</h1>\n")
-	e.Attach(bytes.NewBufferString("Rad attachement"), "rad.txt", "text/plain; charset=utf-8")
+var (
+	_ interface {
+		encoding.TextMarshaler
+		io.WriterTo
+	} = (*Email)(nil)
+	_ io.WriteCloser = (*chunkWriter)(nil)
+)
 
-	raw, err := e.Bytes()
+var dummyEmail = Email{
+	From:    "John Smith <test@gmail.com>",
+	To:      []string{"test@example.com"},
+	BCC:     []string{"test_bcc@example.com", "test2_bcc@example.com"},
+	CC:      []string{"test_cc@example.com"},
+	Subject: "Awesome Subject",
+	Text:    []byte("Text Body is, of course, supported!\n"),
+	HTML:    []byte("<h1>Fancy Html is supported, too!</h1>\n"),
+}
+
+func TestEmail_Attach(t *testing.T) {
+	e := dummyEmail
+	e.Attach(
+		ioutil.NopCloser(bytes.NewBufferString("awesome attachement")),
+		"rad.txt",
+		"text/plain; charset=utf-8",
+	)
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		if _, err := e.WriteTo(pw); err != nil {
+			panic(err)
+		}
+		// if err := pw.Close(); err != nil {
+		//	panic(err)
+		// }
+	}()
+
+	msg, err := mail.ReadMessage(pr)
 	if err != nil {
-		t.Fatal("Failed to render message: ", e)
+		t.Fatal("could not parse rendered message: ", err)
 	}
 
-	msg, err := mail.ReadMessage(bytes.NewBuffer(raw))
-	if err != nil {
-		t.Fatal("Could not parse rendered message: ", err)
-	}
+	// ReadMessage just reads the header.
+	// if err := pr.Close(); err != nil {
+	//	t.Fatal(err)
+	// }
 
-	expectedHeaders := map[string]string{
-		"To":      "test@example.com",
-		"From":    "Jordan Wright <test@example.com>",
-		"Cc":      "test_cc@example.com",
-		"Subject": "Awesome Subject",
+	expectedHeaders := map[string][]string{
+		"To":      e.To,
+		"From":    []string{e.From},
+		"Cc":      e.CC,
+		"Subject": []string{e.Subject},
 	}
 
 	for header, expected := range expectedHeaders {
-		if val := msg.Header.Get(header); val != expected {
-			t.Errorf("Wrong value for message header %s: %v != %v", header, expected, val)
+		got := msg.Header[header]
+		if !reflect.DeepEqual(got, expected) {
+			t.Errorf("wrong value for message header %s: %v != %v",
+				header, expected, got)
 		}
 	}
 
 	// Were the right headers set?
-	ct := msg.Header.Get("Content-type")
+	ct := msg.Header.Get(contentType)
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil {
-		t.Fatal("Content-type header is invalid: ", ct)
+		t.Fatal("Content-Type header is invalid: ", ct)
 	} else if mt != "multipart/mixed" {
-		t.Fatalf("Content-type expected \"multipart/mixed\", not %v", mt)
+		t.Fatalf("Content-Type expected \"multipart/mixed\", not %v", mt)
 	}
 	b := params["boundary"]
 	if b == "" {
@@ -70,11 +102,11 @@ func TestEmailTextHtmlAttachment(t *testing.T) {
 
 	text, err := mixed.NextPart()
 	if err != nil {
-		t.Fatalf("Could not find text component of email: ", err)
+		t.Fatalf("Could not find text component of email: %v", err)
 	}
 
 	// Does the text portion match what we expect?
-	mt, params, err = mime.ParseMediaType(text.Header.Get("Content-type"))
+	mt, params, err = mime.ParseMediaType(text.Header.Get(contentType))
 	if err != nil {
 		t.Fatal("Could not parse message's Content-Type")
 	} else if mt != "multipart/alternative" {
@@ -105,19 +137,18 @@ func TestEmailTextHtmlAttachment(t *testing.T) {
 
 }
 
-func TestEmailFromReader(t *testing.T) {
+func TestNew(t *testing.T) {
 	ex := &Email{
 		Subject: "Test Subject",
-		To:      []string{"Jordan Wright <jmwright798@gmail.com>"},
-		From:    "Jordan Wright <jmwright798@gmail.com>",
+		To:      []string{"John Smith <jsmith@gmail.com>"},
+		From:    "John Smith <jsmith@gmail.com>",
 		Text:    []byte("This is a test email with HTML Formatting. It also has very long lines so\nthat the content must be wrapped if using quoted-printable decoding.\n"),
 		HTML:    []byte("<div dir=\"ltr\">This is a test email with <b>HTML Formatting.</b>\u00a0It also has very long lines so that the content must be wrapped if using quoted-printable decoding.</div>\n"),
 	}
-	raw := []byte(`
-	MIME-Version: 1.0
+	const raw = `MIME-Version: 1.0
 Subject: Test Subject
-From: Jordan Wright <jmwright798@gmail.com>
-To: Jordan Wright <jmwright798@gmail.com>
+From: John Smith <jsmith@gmail.com>
+To: John Smith <jsmith@gmail.com>
 Content-Type: multipart/alternative; boundary=001a114fb3fc42fd6b051f834280
 
 --001a114fb3fc42fd6b051f834280
@@ -134,22 +165,35 @@ Content-Transfer-Encoding: quoted-printable
 also has very long lines so that the content must be wrapped if using quote=
 d-printable decoding.</div>
 
---001a114fb3fc42fd6b051f834280--`)
-	e, err := NewEmailFromReader(bytes.NewReader(raw))
+--001a114fb3fc42fd6b051f834280--`
+
+	e, err := New(strings.NewReader(raw))
 	if err != nil {
-		t.Fatalf("Error creating email %s", err.Error())
+		t.Fatalf("error creating email %v", err)
 	}
 	if e.Subject != ex.Subject {
-		t.Fatalf("Incorrect subject. %#q != %#q", e.Subject, ex.Subject)
+		t.Fatalf(`incorrect subject:
+want: %q
+got : %q
+`, e.Subject, ex.Subject)
 	}
 	if !bytes.Equal(e.Text, ex.Text) {
-		t.Fatalf("Incorrect text: %#q != %#q", e.Text, ex.Text)
+		t.Fatalf(`incorrect text:
+want: %q
+got : %q
+`, e.Text, ex.Text)
 	}
 	if !bytes.Equal(e.HTML, ex.HTML) {
-		t.Fatalf("Incorrect HTML: %#q != %#q", e.HTML, ex.HTML)
+		t.Fatalf(`incorrect HTML:
+want: %q
+got : %q
+`, e.HTML, ex.HTML)
 	}
 	if e.From != ex.From {
-		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
+		t.Fatalf(`incorrect "From":
+want: %q
+got : %q
+`, e.From, ex.From)
 	}
 
 }
@@ -160,7 +204,7 @@ func TestNonMultipartEmailFromReader(t *testing.T) {
 		Subject: "Example Subject (no MIME Type)",
 		Headers: textproto.MIMEHeader{},
 	}
-	ex.Headers.Add("Content-Type", "text/plain; charset=us-ascii")
+	ex.Headers.Add(contentType, "text/plain; charset=us-ascii")
 	ex.Headers.Add("Message-ID", "<foobar@example.com>")
 	raw := []byte(`From: "Foo Bar" <foobar@example.com>
 Content-Type: text/plain
@@ -169,7 +213,7 @@ Subject: Example Subject (no MIME Type)
 Message-ID: <foobar@example.com>
 
 This is a test message!`)
-	e, err := NewEmailFromReader(bytes.NewReader(raw))
+	e, err := New(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatalf("Error creating email %s", err.Error())
 	}
@@ -184,35 +228,59 @@ This is a test message!`)
 	}
 }
 
-func ExampleGmail() {
-	e := NewEmail()
-	e.From = "Jordan Wright <test@gmail.com>"
-	e.To = []string{"test@example.com"}
-	e.Bcc = []string{"test_bcc@example.com"}
-	e.Cc = []string{"test_cc@example.com"}
-	e.Subject = "Awesome Subject"
-	e.Text = []byte("Text Body is, of course, supported!\n")
-	e.HTML = []byte("<h1>Fancy Html is supported, too!</h1>\n")
-	e.Send("smtp.gmail.com:587", smtp.PlainAuth("", e.From, "password123", "smtp.gmail.com"))
+func Example_WriteTo() {
+	e := Email{
+		From:    "John Smith <test@gmail.com>",
+		To:      []string{"test@example.com"},
+		BCC:     []string{"test_bcc@example.com"},
+		CC:      []string{"test_cc@example.com"},
+		Subject: "Awesome Subject",
+		Text:    []byte("Text Body is, of course, supported!\n"),
+		HTML:    []byte("<h1>Fancy Html is supported, too!</h1>\n"),
+	}
+
+	var w io.Writer // network socket, etc.
+
+	if _, err := e.WriteTo(w); err != nil {
+		// handle error...
+	}
 }
 
 func ExampleAttach() {
-	e := NewEmail()
+	var e Email
 	e.AttachFile("test.txt")
 }
 
-func Test_base64Wrap(t *testing.T) {
-	file := "I'm a file long enough to force the function to wrap a\n" +
-		"couple of lines, but I stop short of the end of one line and\n" +
-		"have some padding dangling at the end."
-	encoded := "SSdtIGEgZmlsZSBsb25nIGVub3VnaCB0byBmb3JjZSB0aGUgZnVuY3Rpb24gdG8gd3JhcCBhCmNv\r\n" +
-		"dXBsZSBvZiBsaW5lcywgYnV0IEkgc3RvcCBzaG9ydCBvZiB0aGUgZW5kIG9mIG9uZSBsaW5lIGFu\r\n" +
-		"ZApoYXZlIHNvbWUgcGFkZGluZyBkYW5nbGluZyBhdCB0aGUgZW5kLg==\r\n"
+func Test_chunkWriter(t *testing.T) {
+	const (
+		file = "I'm a file long enough to force the function to wrap a\n" +
+			"couple of lines, but I stop short of the end of one line and\n" +
+			"have some padding dangling at the end."
+		encoded = "SSdtIGEgZmlsZSBsb25nIGVub3VnaCB0byBmb3JjZSB0aGUgZnVuY3Rpb24gdG8gd3JhcCBhCmNv\r\n" +
+			"dXBsZSBvZiBsaW5lcywgYnV0IEkgc3RvcCBzaG9ydCBvZiB0aGUgZW5kIG9mIG9uZSBsaW5lIGFu\r\n" +
+			"ZApoYXZlIHNvbWUgcGFkZGluZyBkYW5nbGluZyBhdCB0aGUgZW5kLg==\r\n"
+	)
 
-	var buf bytes.Buffer
-	base64Wrap(&buf, []byte(file))
-	if !bytes.Equal(buf.Bytes(), []byte(encoded)) {
-		t.Fatalf("Encoded file does not match expected: %#q != %#q", string(buf.Bytes()), encoded)
+	var (
+		buf bytes.Buffer
+		cw  = &chunkWriter{w: &buf}
+		dst = base64.NewEncoder(base64.StdEncoding, cw)
+		src = strings.NewReader(file)
+	)
+	if _, err := io.Copy(dst, src); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if bs := buf.String(); bs != encoded {
+		t.Fatalf(`encoded file does not match expected:
+want: %q
+got : %q
+`, encoded, bs)
 	}
 }
 
@@ -284,7 +352,7 @@ Content-Disposition: inline
 Testing!
 --===============1958295626==--
 `)
-	e, err := NewEmailFromReader(bytes.NewReader(raw))
+	e, err := New(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatalf("Error when parsing email %s", err.Error())
 	}
@@ -319,13 +387,38 @@ func Test_quotedPrintDecode(t *testing.T) {
 	}
 }
 
-func Benchmark_base64Wrap(b *testing.B) {
-	// Reasonable base case; 128K random bytes
-	file := make([]byte, 128*1024)
-	if _, err := rand.Read(file); err != nil {
+var gerr error
+
+func Benchmark_chunkWriter(b *testing.B) {
+	b.StopTimer()
+	var buf [1 << 17]byte
+	if _, err := rand.Read(buf[:]); err != nil {
 		panic(err)
 	}
-	for i := 0; i <= b.N; i++ {
-		base64Wrap(ioutil.Discard, file)
+	var (
+		dst  = &chunkWriter{w: ioutil.Discard}
+		src  = bytes.NewReader(buf[:])
+		lerr error
+	)
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, lerr = io.Copy(dst, src); lerr != nil {
+			panic(lerr)
+		}
 	}
+	gerr = lerr
+}
+
+var gid string
+
+func BenchmarkEmail_messageID(b *testing.B) {
+	var (
+		lid string
+		now = time.Now()
+	)
+	for i := 0; i < b.N; i++ {
+		lid = dummyEmail.messageID(now)
+	}
+	gid = lid
 }
